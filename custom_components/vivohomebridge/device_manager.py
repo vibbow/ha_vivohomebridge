@@ -1481,7 +1481,7 @@ class DeviceManager:
     ) -> (list)[DeviceEntry]:
         return [
             device
-            for device in registry.devices.values()
+            for device in registry.devices
             if device.config_entry_id == config_entry_id
             and device.entry_type is not dr.DeviceEntryType.SERVICE
         ]
@@ -1968,7 +1968,7 @@ class DeviceManager:
         devices = entry_data[VIVO_HA_CONFIG_DATA_DEVICES_KEY]
         if devices is not None:
             dev_reg = dr.async_get(self._bridge_entity.hass)
-            reg_devices = list(dev_reg.devices.values())
+            reg_devices = list(dev_reg.devices)
             for reg_device_item in reg_devices:
                 if (
                     reg_device_item.config_entry_id
