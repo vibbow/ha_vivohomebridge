@@ -3,5 +3,5 @@
   "country": ["CN"],
   "content_in_root": false,
   "render_readme": true,
-  "homeassistant": "2025.1"
+  "homeassistant": "2026.11.0"
 }

@@ -43,7 +43,10 @@ class VAttributeUtils:
             if obj is None or obj['h2v_converter'] is None:
                 continue
             h2v_converter = obj['h2v_converter']
-            v_data[obj[VIVO_KEY_WORD_V_NAME]] = h2v_converter(entity_id, 0, obj, val)
+            v_val = h2v_converter(entity_id, 0, obj, val)
+            if v_val is None:
+                continue
+            v_data[obj[VIVO_KEY_WORD_V_NAME]] = v_val
         return v_data
 
     @staticmethod

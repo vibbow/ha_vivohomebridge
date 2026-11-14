@@ -99,6 +99,7 @@ class VBridgeEntity:
         self.sensor_model = VSensorModel(hass, config_entry, "sensors")
         self.switch_model = VSwitchModel(hass, config_entry, "switch")
         self.climate_model = VClimateModel(hass, config_entry, "climate")
+        self.climate_model.on_status_refresh = self._refresh_entity_status
         self.fan_model = VFanModel(hass, config_entry, "fan")
         self.cover_model = VCoverModel(hass, config_entry, "cover")
         self.tv_model = VTVModel(
@@ -589,6 +590,14 @@ class VBridgeEntity:
                     del item[ATTR_ENTITY_ID]
 
         return unregister_devices
+
+    def _refresh_entity_status(self, entity_id: str):
+        device = next(
+            (d for d in self.bridge_config_data if d.get(VIVO_DEVICE_ENTITY_ID_KEY) == entity_id),
+            None,
+        )
+        if device is not None:
+            self.flush_device_status("refresh", device)
 
     def flush_device_status(self, reason: str, device: dict):
         """new device integration"""

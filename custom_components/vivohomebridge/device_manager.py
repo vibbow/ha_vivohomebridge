@@ -430,10 +430,9 @@ class DeviceManager:
         payload = {}
         payload[VIVO_HA_CONF_ADDABLE_DEVS] = unregister_devices
 
-        hass.bus.fire(
-            EVENT_VHOME_DEV_STATE_CHANGE,
-            {"data": payload, VIVO_DEVICE_NAME_CONFIG_KEY: None, "domain": DOMAIN},
-        )
+        # 可添加设备列表很大，走事件总线会超过 recorder 的 32KB 上限而被丢弃并刷警告，
+        # 且只有本类自己在监听，所以直接上报，不经过事件总线
+        await self._async_report_state(None, payload)
 
     async def async_remove_sub_devices(self):
         if self._bridge_entity is None:
@@ -1483,7 +1482,7 @@ class DeviceManager:
         return [
             device
             for device in registry.devices.values()
-            if config_entry_id in device.config_entries
+            if device.config_entry_id == config_entry_id
             and device.entry_type is not dr.DeviceEntryType.SERVICE
         ]
 
@@ -1843,6 +1842,11 @@ class DeviceManager:
 
     async def _async_handle_state_change_event(self, event) -> None:
         VLog.info(_TAG, "_async_handle_state_change_event")
+        await self._async_report_state(
+            event.data.get(VIVO_DEVICE_NAME_CONFIG_KEY), event.data.get("data")
+        )
+
+    async def _async_report_state(self, device_name, data) -> None:
         bridge_device = DeviceManager.instance().get_bridge_device()
         if (
             not bridge_device.host_list
@@ -1854,9 +1858,7 @@ class DeviceManager:
                 f"Bridge_device data:{bridge_device} is not useful,don't async_data_report",
             )
             return
-        await self.async_data_report(
-            event.data.get(VIVO_DEVICE_NAME_CONFIG_KEY), event.data.get("data")
-        )
+        await self.async_data_report(device_name, data)
 
     async def _async_handle_state_flush_event(self, event) -> None:
         if self._bridge_entity is None:
@@ -1966,11 +1968,11 @@ class DeviceManager:
         devices = entry_data[VIVO_HA_CONFIG_DATA_DEVICES_KEY]
         if devices is not None:
             dev_reg = dr.async_get(self._bridge_entity.hass)
-            reg_devices = list(dev_reg._device_data.values())
+            reg_devices = list(dev_reg.devices.values())
             for reg_device_item in reg_devices:
-                config_entries = list(reg_device_item.config_entries)
                 if (
-                    self._bridge_entity.config_entry.entry_id in config_entries
+                    reg_device_item.config_entry_id
+                    == self._bridge_entity.config_entry.entry_id
                     and reg_device_item.entry_type is not dr.DeviceEntryType.SERVICE
                 ):
                     reg_flag = False

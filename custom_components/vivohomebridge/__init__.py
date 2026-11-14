@@ -57,6 +57,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_init(hass, entry):
     bridge_entity = VBridgeEntity(hass, entry)
+    await bridge_entity.climate_model.async_load_last_modes()
     DeviceManager.instance().set_bridge(bridge_entity)
     DeviceManager.instance().set_local_service(hass)
     await DeviceManager.instance().async_dm_service_start(hass)
@@ -81,4 +82,6 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> 
     await DeviceManager.instance().instance().get_local_server().sync_stop()
     await DeviceManager.instance().instance().get_vhome().network_shakehand_task_stop()
     await DeviceManager.instance().uninstall()
+    if (bridge := DeviceManager.instance().get_bridge_entity()) is not None:
+        bridge.climate_model.close()
     return True

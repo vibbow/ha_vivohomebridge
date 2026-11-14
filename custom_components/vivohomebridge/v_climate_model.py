@@ -4,7 +4,7 @@
 
     http://www.apache.org/licenses/LICENSE-2.0
 """
-from typing import Mapping, Any
+from typing import Any, Callable, Mapping
 
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_SUPPORTED_FEATURES, Platform
 from .v_attribute import (
@@ -13,6 +13,7 @@ from .v_attribute import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.components.climate import (
     ClimateEntityFeature,
     SWING_VERTICAL,
@@ -24,9 +25,14 @@ from homeassistant.components.climate import (
     ATTR_MIN_TEMP,
     ATTR_MAX_TEMP,
     ATTR_TARGET_TEMP_STEP, ATTR_FAN_MODES, ATTR_MIN_HUMIDITY, ATTR_MAX_HUMIDITY, ATTR_SWING_MODE, ATTR_HVAC_MODE,
-    ATTR_HVAC_MODES, ATTR_HVAC_ACTION, ATTR_FAN_MODE, ATTR_SWING_MODES, SWING_BOTH, SWING_OFF
+    ATTR_HVAC_MODES, ATTR_FAN_MODE, ATTR_SWING_MODES, SWING_BOTH, SWING_OFF
 )
 from .utils import Utils
+from .v_homekit_fan import (
+    SteppedRotation,
+    get_stepped_rotation,
+    subscribe_rotation,
+)
 from .v_utils.vattributes_utils import VAttributeUtils
 from .v_utils.vlog import VLog
 
@@ -37,6 +43,8 @@ CLIMATE_MIN_HUMIDITY = 1
 CLIMATE_MAX_HUMIDITY = 100
 CLIMATE_HUMIDITY_STEP = 1
 _TAG = "climate"
+STORAGE_KEY = "vivohomebridge.climate_last_mode"
+_NO_MODE_STATES = ("off", "unavailable", "unknown")
 
 
 class VClimateModel:
@@ -44,6 +52,13 @@ class VClimateModel:
         self.hass = hass
         self.entry = entry
         self.domain = domain
+        # 开机时恢复的上次非 off 模式：entity_id -> hvac mode
+        self._last_modes: dict[str, str] = {}
+        self._store = Store(hass, 1, STORAGE_KEY)
+        # HomeKit 转速特征订阅：entity_id -> 取消订阅函数（None 表示不可订阅）
+        self._rotation_unsubs: dict[str, Callable[[], None] | None] = {}
+        # 状态需要主动刷新给 vivo 时调用，参数为 entity_id（由 VBridgeEntity 设置）
+        self.on_status_refresh: Callable[[str], None] | None = None
         self.attributes_map = [
             {
                 VIVO_KEY_WORD_V_NAME: "vivo_std_power",
@@ -66,12 +81,6 @@ class VClimateModel:
                 "h2v_converter": self.h2v_hvac_mode
             },
             {
-                # 运行模式
-                VIVO_KEY_WORD_V_NAME: "vivo_std_mode",
-                VIVO_KEY_WORD_H_NAME: ATTR_HVAC_ACTION,
-                "v2h_converter": self.v2h_hvac_mode,
-                "h2v_converter": self.h2v_hvac_mode
-            }, {
                 # 目标温度
                 VIVO_KEY_WORD_V_NAME: "vivo_std_temperature",
                 VIVO_KEY_WORD_H_NAME: "temperature",
@@ -108,17 +117,77 @@ class VClimateModel:
             }
         ]
 
+    async def async_load_last_modes(self) -> None:
+        data = await self._store.async_load()
+        if isinstance(data, dict):
+            self._last_modes = {k: v for k, v in data.items() if isinstance(v, str)}
+
+    def _remember_mode(self, entity_id: str, mode) -> None:
+        mode = getattr(mode, "value", mode)
+        if not isinstance(mode, str) or mode in _NO_MODE_STATES:
+            return
+        if self._last_modes.get(entity_id) == mode:
+            return
+        self._last_modes[entity_id] = mode
+        # h2v 可能不在事件循环线程里被调用，用线程安全的方式安排保存
+        self.hass.loop.call_soon_threadsafe(
+            self._store.async_delay_save, lambda: dict(self._last_modes), 5
+        )
+
+    def _turn_on_mode(self, entity_id: str) -> str | None:
+        """开机用的运行模式：上次的非 off 模式 > 制冷 > 制热 > 第一个非 off 模式。
+        HA 的 climate.turn_on 总是选制热，会把制冷中的空调开成制热。"""
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        modes = [getattr(m, "value", m) for m in state.attributes.get(ATTR_HVAC_MODES) or []]
+        last = self._last_modes.get(entity_id)
+        if last in modes:
+            return last
+        for mode in ("cool", "heat"):
+            if mode in modes:
+                return mode
+        return next((m for m in modes if m != "off"), None)
+
     def v2h_onoff(self, device_id: str, index: int, on_off: dict, val):
-        """Turn off the climate."""
+        """Turn on/off the climate."""
         VLog.info(_TAG, f"[v2h_onoff],val:{val}")
-        service: str = "turn_on"
         h_attributes: dict = {ATTR_ENTITY_ID: device_id}
         if val == "off":
-            service = "turn_off"
-        else:
-            service = "turn_on"
+            return "turn_off", h_attributes
+        if (mode := self._turn_on_mode(device_id)) is not None:
+            h_attributes[ATTR_HVAC_MODE] = mode
+            return SERVICE_SET_HVAC_MODE, h_attributes
+        return "turn_on", h_attributes
 
-        return service, h_attributes
+    def close(self) -> None:
+        for unsub in self._rotation_unsubs.values():
+            if callable(unsub):
+                unsub()
+        self._rotation_unsubs.clear()
+
+    def _stepped_rotation(self, entity_id: str) -> SteppedRotation | None:
+        st = get_stepped_rotation(self.hass, entity_id)
+        if st is not None and entity_id not in self._rotation_unsubs:
+            self._rotation_unsubs[entity_id] = subscribe_rotation(
+                st, lambda: self._refresh(entity_id)
+            )
+        return st
+
+    def _refresh(self, entity_id: str) -> None:
+        if self.on_status_refresh is not None:
+            self.on_status_refresh(entity_id)
+
+    async def _async_set_stepped_fan_mode(
+        self, entity_id: str, st: SteppedRotation, fan_mode: str
+    ) -> None:
+        try:
+            await st.async_set_fan_mode(fan_mode)
+        except Exception as e:  # noqa: BLE001
+            VLog.warning(_TAG, f"[set_stepped_fan_mode] {entity_id} {fan_mode} failed:{e}")
+            return
+        # 相邻档位在原实体上可能显示为同一个风速，状态不变，主动刷新
+        self._refresh(entity_id)
 
     def h2v_onoff(self, device_id: str, index: int, on_off: dict, val):
         """返回开关状态."""
@@ -129,6 +198,7 @@ class VClimateModel:
 
     def h2v_hvac_mode(self, device_id: str, index: int, on_off: dict, val):
         VLog.info(_TAG, f"[h2v_hvac_mode],val:{val}")
+        self._remember_mode(device_id, val)
         return VAttributeUtils.h2v_mode_get_value(Platform.CLIMATE, ATTR_HVAC_MODES, val)
 
     def v2h_hvac_mode(self, device_id: str, index: int, on_off: dict, val):
@@ -138,6 +208,7 @@ class VClimateModel:
         service: str = SERVICE_SET_HVAC_MODE
         h_attributes: dict = {ATTR_ENTITY_ID: device_id, h_attr_key: val}
         h_attributes = VAttributeUtils.v2h_mode_get_attr(h_mode_key, h_attr_key, val, Platform.CLIMATE, h_attributes)
+        self._remember_mode(device_id, h_attributes.get(h_attr_key))
         return service, h_attributes
 
     def h2v_target_temperature(self, device_id: str, index: int, on_off: dict, val):
@@ -168,6 +239,12 @@ class VClimateModel:
 
     def h2v_fan_mode(self, device_id: str, index: int, on_off: dict, val):
         VLog.info(_TAG, f"[h2v_fan_mode] val:{val}")
+        if (st := self._stepped_rotation(device_id)) is not None:
+            # 按转速档位直接映射，不用 homekit_controller 换算的风速
+            val = st.fan_mode_for_current_value()
+        # 风速里的 off 在 vivo 里是无法识别的选项
+        if val is None or val == "off":
+            return None
         return VAttributeUtils.h2v_mode_get_value(Platform.CLIMATE, ATTR_FAN_MODES, val)
 
     def v2h_fan_mode(self, device_id: str, index: int, on_off: dict, val):
@@ -177,6 +254,15 @@ class VClimateModel:
         service: str = SERVICE_SET_FAN_MODE
         h_attributes: dict = {ATTR_ENTITY_ID: device_id, h_attr_key: val}
         h_attributes = VAttributeUtils.v2h_mode_get_attr(h_mode_key, h_attr_key, val, Platform.CLIMATE, h_attributes)
+        if (st := self._stepped_rotation(device_id)) is not None:
+            fan_mode = h_attributes.get(h_attr_key)
+            if fan_mode not in st.settable_names:
+                VLog.warning(_TAG, f"[v2h_fan_mode] unsupported fan mode {fan_mode}")
+                return None, None
+            self.hass.async_create_task(
+                self._async_set_stepped_fan_mode(device_id, st, fan_mode)
+            )
+            return None, None
         return service, h_attributes
 
     def h2v_swing_mode_vertical(self, device_id: str, index: int, on_off: dict, val):
@@ -318,12 +404,14 @@ class VClimateModel:
         if (ClimateEntityFeature.FAN_MODE & ClimateEntityFeature(supported_features)) != 0:
             # 支持设置风扇模式
             h_fan_modes: list = entity_attributes.get(ATTR_FAN_MODES, None)
+            if (st := get_stepped_rotation(hass, entity_id)) is not None:
+                h_fan_modes = st.settable_names
             if h_fan_modes is not None and len(h_fan_modes) > 0:
                 h_key = ATTR_FAN_MODES
                 v_fan_mode_dict: dict = VAttributeUtils.get_model_item(Platform.CLIMATE, h_key)
                 if v_fan_mode_dict is not None:
                     v_fan_mode_dict["value_list"] = VAttributeUtils.get_value_list(v_fan_mode_dict["value_list"],
-                                                                                   h_fan_modes, [])
+                                                                                   h_fan_modes, ["off"])
                     if v_fan_mode_dict["value_list"] is not None and len(v_fan_mode_dict["value_list"]) > 0:
                         VLog.info(_TAG, f"[model_get] {entity_id} "
                                         f"support {h_key}:{v_fan_mode_dict["value_list"]} fan_modes:{h_fan_modes}")
@@ -384,7 +472,8 @@ class VClimateModel:
             else:
                 VLog.info(_TAG, f"[calibrate_current_attrs] not support {h_attributes}")
         if new_state != old_state:
-            h_attributes[ATTR_HVAC_ACTION] = new_state
+            # 运行模式只看实体状态，不看 hvac_action：cooling/heating 不是运行模式
+            h_attributes["state"] = new_state
 
     @classmethod
     def calibrate_swing_mode_attr_when_flush(cls, h_attributes: dict):
